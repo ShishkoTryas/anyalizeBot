@@ -12,6 +12,7 @@ if (!BOT_TOKEN) {
 const NETWORKS = {
   ETH: {
     label: 'Ethereum',
+    rpc: process.env.ETH_RPC || 'https://eth.llamarpc.com',
     ws: process.env.ETH_WS || 'wss://eth.llamarpc.com',
     factory: '0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f',
     weth: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
@@ -19,13 +20,15 @@ const NETWORKS = {
   },
   BSC: {
     label: 'BSC',
-    ws: process.env.BSC_WS || 'wss://bsc.publicnode.com',
+    rpc: process.env.BSC_RPC || 'https://bsc-dataseed.binance.org/',
+    ws: process.env.BSC_WS || 'wss://go.getblock.io/c63d882b922d447f9e6c9aabfe9a573f', // ЗАМЕНИТЕ API KEY
     factory: '0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73',
     weth: '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c',
     explorer: 'https://bscscan.com/tx/'
   },
   BASE: {
     label: 'Base',
+    rpc: process.env.BASE_RPC || 'https://mainnet.base.org',
     ws: process.env.BASE_WS || 'wss://base.llamarpc.com',
     factory: '0xFDa619b6d20975be80A10332cD39b9a4b0FAa8BB',
     weth: '0x4200000000000000000000000000000000000006',
@@ -38,16 +41,19 @@ const FACTORY_ABI = ['function getPair(address,address) view returns (address)']
 const PAIR_ABI = [
   'event Swap(address indexed sender, uint amount0In, uint amount1In, uint amount0Out, uint amount1Out, address indexed to)',
   'function token0() external view returns (address)',
-  'function token1() external view returns (address)'
+  'function token1() external view returns (address)',
+  'function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)'
 ];
 const ERC20_ABI = [
   'function symbol() view returns (string)',
-  'function decimals() view returns (uint8)'
+  'function decimals() view returns (uint8)',
+  'function name() view returns (string)'
 ];
 
 // Initialize bot
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 const users = new Map();
+const activeSubscriptions = new Map();
 
 const mainMenu = {
   reply_markup: {
@@ -59,14 +65,10 @@ const mainMenu = {
 
 // Функция для очистки и валидации адреса
 function cleanAndValidateAddress(input) {
-  // Удаляем все не-шестнадцатеричные символы
   let cleaned = input.replace(/[^a-fA-F0-9x]/g, '');
-  
-  // Удаляем возможные дубликаты '0x'
   cleaned = cleaned.replace(/^0x+|0x$/g, '');
   cleaned = '0x' + cleaned;
   
-  // Проверяем длину
   if (cleaned.length !== 42) {
     throw new Error(`Неверная длина адреса: ${cleaned.length} символов (должно быть 42)`);
   }
@@ -78,26 +80,250 @@ function cleanAndValidateAddress(input) {
 async function getTokenInfo(address, provider) {
   try {
     const c = new ethers.Contract(address, ERC20_ABI, provider);
-    const [symbol, decimals] = await Promise.all([
+    const [symbol, decimals, name] = await Promise.all([
       c.symbol(),
-      c.decimals()
+      c.decimals(),
+      c.name()
     ]);
-    return { symbol, decimals: decimals || 18 };
-  } catch {
-    return { symbol: 'TOKEN', decimals: 18 };
+    return { 
+      symbol: symbol || 'UNKNOWN', 
+      decimals: decimals || 18,
+      name: name || 'Unknown Token',
+      address
+    };
+  } catch (e) {
+    console.error('Ошибка получения информации о токене:', e);
+    return { 
+      symbol: 'TOKEN', 
+      decimals: 18,
+      name: 'Unknown Token',
+      address
+    };
   }
+}
+
+// Глобальные провайдеры для сетей
+const networkProviders = {};
+
+// Функция для получения или создания провайдера
+async function getOrCreateProvider(networkKey) {
+  if (networkProviders[networkKey] && networkProviders[networkKey].provider) {
+    return networkProviders[networkKey].provider;
+  }
+
+  const net = NETWORKS[networkKey];
+  try {
+    console.log(`[${networkKey}] Создаем нового WebSocket провайдера...`);
+    
+    const provider = new ethers.providers.WebSocketProvider(net.ws);
+    
+    provider._networkKey = networkKey;
+    
+    // Обработчики событий
+    provider.on('error', (error) => {
+      console.error(`[${networkKey}] WebSocket Error:`, error);
+    });
+    
+    provider._websocket.on('close', (code, reason) => {
+      console.log(`[${networkKey}] WebSocket закрыт (${code}: ${reason})`);
+      // Переподключаемся через 5 секунд
+      setTimeout(() => {
+        console.log(`[${networkKey}] Попытка переподключения...`);
+        getOrCreateProvider(networkKey).then(newProvider => {
+          // Восстанавливаем подписки
+          restoreSubscriptions(networkKey, newProvider);
+        }).catch(e => console.error(`[${networkKey}] Ошибка переподключения:`, e));
+      }, 5000);
+    });
+    
+    provider._websocket.on('open', () => {
+      console.log(`[${networkKey}] WebSocket подключен`);
+    });
+    
+    // Проверяем подключение
+    provider.getBlockNumber()
+      .then(block => console.log(`[${networkKey}] Подключено! Последний блок: ${block}`))
+      .catch(e => console.error(`[${networkKey}] Ошибка проверки подключения:`, e));
+    
+    // Сохраняем провайдер
+    networkProviders[networkKey] = {
+      provider,
+      subscriptions: []
+    };
+    
+    return provider;
+  } catch (e) {
+    console.error(`[${networkKey}] Ошибка создания провайдера:`, e);
+    // Попробуем снова через 5 секунд
+    return new Promise((resolve, reject) => {
+      setTimeout(() => {
+        getOrCreateProvider(networkKey)
+          .then(resolve)
+          .catch(reject);
+      }, 5000);
+    });
+  }
+}
+
+// Восстановление подписок при переподключении
+async function restoreSubscriptions(networkKey, newProvider) {
+  const netInfo = networkProviders[networkKey];
+  if (!netInfo) return;
+
+  console.log(`[${networkKey}] Восстанавливаем ${netInfo.subscriptions.length} подписок`);
+  
+  // Пересоздаем подписки с новым провайдером
+  for (const sub of [...netInfo.subscriptions]) {
+    try {
+      console.log(`[${networkKey}] Восстанавливаем подписку для ${sub.tokenSymbol}...`);
+      
+      // Удаляем старую подписку
+      if (sub.pair && sub.pair.removeListener) {
+        sub.pair.removeListener('Swap', sub.handler);
+      }
+      
+      // Создаем новую пару с новым провайдером
+      const pair = new ethers.Contract(sub.pairAddress, PAIR_ABI, newProvider);
+      
+      // Получаем актуальные адреса токенов
+      const [token0, token1] = await Promise.all([
+        pair.token0(),
+        pair.token1()
+      ]);
+      
+      // Создаем новый обработчик
+      const swapHandler = createSwapHandler(
+        sub.chatId,
+        networkKey,
+        sub.tokenAddress,
+        token0,
+        token1,
+        sub.tokenInfo
+      );
+      
+      // Подписываемся на события
+      pair.on('Swap', swapHandler);
+      
+      // Обновляем подписку
+      const index = netInfo.subscriptions.findIndex(s => 
+        s.pairAddress === sub.pairAddress && s.chatId === sub.chatId
+      );
+      
+      if (index !== -1) {
+        netInfo.subscriptions[index] = {
+          ...sub,
+          pair,
+          provider: newProvider,
+          handler: swapHandler,
+          token0,
+          token1
+        };
+      }
+      
+      console.log(`[${networkKey}] Подписка восстановлена для ${sub.tokenSymbol}`);
+    } catch (e) {
+      console.error(`[${networkKey}] Ошибка восстановления подписки:`, e);
+    }
+  }
+}
+
+// Функция для создания обработчика событий Swap
+function createSwapHandler(chatId, netKey, tokenAddress, token0, token1, tokenInfo) {
+  const net = NETWORKS[netKey];
+  
+  return async (sender, amount0In, amount1In, amount0Out, amount1Out, to, event) => {
+    try {
+      console.log(`[${netKey}] Swap event detected for ${tokenInfo.symbol}`);
+      
+      // Пропускаем нулевые свапы
+      if (amount0In.isZero() && amount1In.isZero() && 
+          amount0Out.isZero() && amount1Out.isZero()) return;
+      
+      // Определяем, какой токен куда перемещается
+      const tokenIn = amount0In.gt(0) ? token0 : 
+                     amount1In.gt(0) ? token1 : null;
+      const tokenOut = amount0Out.gt(0) ? token0 : 
+                      amount1Out.gt(0) ? token1 : null;
+      
+      // Проверяем, что свап касается нашего токена
+      const isOurTokenIn = tokenIn && tokenIn.toLowerCase() === tokenAddress.toLowerCase();
+      const isOurTokenOut = tokenOut && tokenOut.toLowerCase() === tokenAddress.toLowerCase();
+      
+      // Если свап не касается нашего токена, пропускаем
+      if (!isOurTokenIn && !isOurTokenOut) return;
+      
+      // Определяем направление сделки
+      const direction = isOurTokenIn ? "🔴 ПРОДАЖА" : "🟢 ПОКУПКА";
+      const baseSymbol = netKey === 'BSC' ? 'BNB' : netKey === 'BASE' ? 'ETH' : 'ETH';
+      
+      // Рассчитываем суммы
+      let tokenAmount, baseAmount;
+      
+      if (isOurTokenIn) {
+        // Продажа: наш токен входит, база выходит
+        tokenAmount = tokenIn === token0 ? amount0In : amount1In;
+        baseAmount = tokenIn === token0 ? amount1Out : amount0Out;
+      } else {
+        // Покупка: база входит, наш токен выходит
+        tokenAmount = tokenOut === token0 ? amount0Out : amount1Out;
+        baseAmount = tokenOut === token0 ? amount1In : amount0In;
+      }
+      
+      // Пропускаем слишком маленькие сделки (меньше 0.01 USD в эквиваленте)
+      const minBaseAmount = ethers.utils.parseUnits('0.01', 18);
+      if (baseAmount.lt(minBaseAmount)) {
+        console.log(`Пропущена маленькая сделка: ${ethers.utils.formatUnits(baseAmount, 18)} ${baseSymbol}`);
+        return;
+      }
+      
+      // Получаем время блока
+      const block = await event.getBlock();
+      const txTime = new Date(block.timestamp * 1000).toLocaleString();
+      const explorerUrl = `${net.explorer}${event.transactionHash}`;
+      
+      // Форматируем числа
+      const formattedTokenAmount = ethers.utils.formatUnits(
+        tokenAmount, 
+        tokenInfo.decimals
+      );
+      
+      const formattedBaseAmount = ethers.utils.formatUnits(baseAmount, 18);
+      
+      // Форматируем для вывода
+      const tokenDisplay = parseFloat(formattedTokenAmount).toLocaleString('en', {
+        maximumFractionDigits: tokenInfo.decimals > 6 ? 6 : 4
+      });
+      
+      const baseDisplay = parseFloat(formattedBaseAmount).toLocaleString('en', {
+        maximumFractionDigits: 6
+      });
+      
+      const pricePerToken = (parseFloat(formattedBaseAmount) / parseFloat(formattedTokenAmount)).toFixed(8);
+      
+      const message = `${direction} ${tokenInfo.symbol} (${tokenInfo.name})\n` +
+        `Сеть: ${net.label}\n` +
+        `Сумма: ${tokenDisplay} ${tokenInfo.symbol}\n` +
+        `Цена: ${pricePerToken} ${baseSymbol}\n` +
+        `Общая стоимость: ${baseDisplay} ${baseSymbol}\n` +
+        `TX: <a href="${explorerUrl}">${event.transactionHash.substring(0, 12)}...</a>\n` +
+        `Время: ${txTime}`;
+      
+      bot.sendMessage(chatId, message, { parse_mode: 'HTML' });
+    } catch (err) {
+      console.error('Ошибка в обработчике события:', err);
+    }
+  };
 }
 
 // /start handler
 bot.onText(/\/start/, (msg) => {
   const chatId = msg.chat.id;
-
-  // Очищаем предыдущие подписки
+  
   if (users.has(chatId)) {
     const user = users.get(chatId);
     user.subscriptions.forEach(unsub => unsub());
   }
-
+  
   users.set(chatId, { 
     state: 'choose_network', 
     network: null, 
@@ -136,6 +362,9 @@ bot.on('message', async (msg) => {
 
   // Ввод контракта токена
   if (user.state === 'enter_contract') {
+    user.subscriptions.forEach(unsub => unsub());
+    user.subscriptions = [];
+    
     const netKey = user.network;
     const net = NETWORKS[netKey];
     
@@ -147,16 +376,17 @@ bot.on('message', async (msg) => {
       return bot.sendMessage(chatId, `Ошибка адреса: ${e.message}\nПример правильного адреса: 0x742d35Cc6634C0532925a3b844Bc454e4438f44e`);
     }
 
-    const provider = new ethers.providers.WebSocketProvider(net.ws);
+    const provider = await getOrCreateProvider(netKey);
     
-    // Обработка ошибок подключения
-    provider.on('error', (error) => {
-      console.error(`${netKey} Provider Error:`, error);
-      bot.sendMessage(chatId, `Ошибка подключения к сети ${netKey}. Попробуйте позже.`);
-    });
-
     // Получаем информацию о токене
-    const tokenInfo = await getTokenInfo(tokenAddress, provider);
+    let tokenInfo;
+    try {
+      tokenInfo = await getTokenInfo(tokenAddress, provider);
+    } catch (e) {
+      console.error('Ошибка получения информации о токене:', e);
+      return bot.sendMessage(chatId, 'Ошибка при получении информации о токене. Проверьте адрес.');
+    }
+    
     user.tokenInfo = tokenInfo;
     
     // Ищем пару с WETH
@@ -196,106 +426,141 @@ bot.on('message', async (msg) => {
       return bot.sendMessage(chatId, 'Ошибка: указанный токен не найден в паре.', mainMenu);
     }
     
-    // Подписываемся на событие Swap конкретной пары
-    const swapHandler = async (sender, amount0In, amount1In, amount0Out, amount1Out, to, event) => {
-      try {
-        // Пропускаем нулевые свапы
-        if (amount0In.isZero() && amount1In.isZero() && 
-            amount0Out.isZero() && amount1Out.isZero()) return;
-        
-        // Получаем детали транзакции
-        const tx = await event.getTransaction();
-        const txReceipt = await tx.wait();
-        
-        // Пропускаем неудачные транзакции
-        if (!txReceipt || txReceipt.status !== 1) return;
-        
-        // Определяем, какой токен куда перемещается
-        const tokenIn = amount0In.gt(0) ? token0 : (amount1In.gt(0) ? token1 : null);
-        const tokenOut = amount0Out.gt(0) ? token0 : (amount1Out.gt(0) ? token1 : null);
-        
-        // Проверяем, что свап касается нашего токена
-        const isOurTokenIn = tokenIn && tokenIn.toLowerCase() === tokenAddress.toLowerCase();
-        const isOurTokenOut = tokenOut && tokenOut.toLowerCase() === tokenAddress.toLowerCase();
-        
-        // Если свап не касается нашего токена, пропускаем
-        if (!isOurTokenIn && !isOurTokenOut) return;
-        
-        // Определяем направление сделки
-        const direction = isOurTokenIn ? "🔴 ПРОДАЖА" : "🟢 ПОКУПКА";
-        const baseSymbol = netKey === 'BSC' ? 'BNB' : 'ETH';
-        
-        // Рассчитываем суммы
-        let tokenAmount, baseAmount;
-        
-        if (isOurTokenIn) {
-          // Продажа: наш токен входит, база выходит
-          tokenAmount = tokenIn === token0 ? 
-            ethers.utils.formatUnits(amount0In, tokenInfo.decimals) :
-            ethers.utils.formatUnits(amount1In, tokenInfo.decimals);
-            
-          baseAmount = tokenIn === token0 ? 
-            ethers.utils.formatUnits(amount1Out, 18) :
-            ethers.utils.formatUnits(amount0Out, 18);
-        } else {
-          // Покупка: база входит, наш токен выходит
-          tokenAmount = tokenOut === token0 ? 
-            ethers.utils.formatUnits(amount0Out, tokenInfo.decimals) :
-            ethers.utils.formatUnits(amount1Out, tokenInfo.decimals);
-            
-          baseAmount = tokenOut === token0 ? 
-            ethers.utils.formatUnits(amount1In, 18) :
-            ethers.utils.formatUnits(amount0In, 18);
-        }
-        
-        // Форматируем числа
-        const formattedTokenAmount = parseFloat(tokenAmount).toLocaleString('en', {
-          maximumFractionDigits: tokenInfo.decimals > 6 ? 4 : 2
-        });
-        
-        const formattedBaseAmount = parseFloat(baseAmount).toLocaleString('en', {
-          maximumFractionDigits: 6
-        });
-        
-        const explorerUrl = `${net.explorer}${event.transactionHash}`;
-        const time = new Date().toLocaleString();
-        
-        const message = `${direction} ${tokenInfo.symbol}\n` +
-          `Сеть: ${net.label}\n` +
-          `Трейдер: ${tx.from}\n` +
-          `Сумма: ${formattedTokenAmount} ${tokenInfo.symbol}\n` +
-          `За: ${formattedBaseAmount} ${baseSymbol}\n` +
-          `TX: ${explorerUrl}\n` +
-          `Время: ${time}`;
-        
-        bot.sendMessage(chatId, message);
-      } catch (err) {
-        console.error('Ошибка в обработчике события:', err);
-      }
-    };
+    // Создаем обработчик событий
+    const swapHandler = createSwapHandler(
+      chatId,
+      netKey,
+      tokenAddress,
+      token0,
+      token1,
+      tokenInfo
+    );
 
     // Подписываемся на события
-    const filter = pair.filters.Swap();
-    pair.on(filter, swapHandler);
+    pair.on('Swap', swapHandler);
+    
+    // Сохраняем подписку
+    const subId = `${chatId}-${netKey}-${tokenAddress}`;
+    
+    // Добавляем подписку в глобальный список
+    if (networkProviders[netKey]) {
+      networkProviders[netKey].subscriptions.push({
+        chatId,
+        pairAddress,
+        tokenSymbol: tokenInfo.symbol,
+        tokenAddress,
+        tokenInfo,
+        token0,
+        token1,
+        handler: swapHandler,
+        pair,
+        provider
+      });
+    }
+    
+    activeSubscriptions.set(subId, {
+      network: netKey,
+      pairAddress,
+      pair,
+      provider,
+      handler: swapHandler
+    });
     
     // Функция для отписки
     const unsubscribe = () => {
-      pair.removeAllListeners(filter);
-      provider.destroy();
-      console.log(`Отписались от ${tokenInfo.symbol} в ${netKey}`);
+      try {
+        pair.removeListener('Swap', swapHandler);
+        activeSubscriptions.delete(subId);
+        
+        // Удаляем из глобального списка
+        if (networkProviders[netKey]) {
+          const index = networkProviders[netKey].subscriptions.findIndex(
+            sub => sub.pairAddress === pairAddress && sub.chatId === chatId
+          );
+          if (index !== -1) {
+            networkProviders[netKey].subscriptions.splice(index, 1);
+          }
+        }
+        
+        console.log(`Отписались от ${tokenInfo.symbol} в ${netKey}`);
+      } catch (e) {
+        console.error('Ошибка при отписке:', e);
+      }
     };
     
     // Сохраняем функцию отписки
     user.subscriptions.push(unsubscribe);
     user.state = 'choose_network';
     
-    bot.sendMessage(
-      chatId,
-      `✅ Подписка на ${tokenInfo.symbol} (${tokenAddress}) в сети ${net.label} активна!\n\nТеперь вы будете получать уведомления о сделках с этим токеном.`,
-      mainMenu
-    );
+    // Проверяем активность пула
+    try {
+      const reserves = await pair.getReserves();
+      const reserve0 = ethers.utils.formatUnits(reserves[0], tokenInfo.decimals);
+      const reserve1 = ethers.utils.formatUnits(reserves[1], 18);
+      
+      bot.sendMessage(
+        chatId,
+        `✅ Подписка на ${tokenInfo.symbol} (${tokenInfo.name}) в сети ${net.label} активна!\n` +
+        `Адрес токена: <code>${tokenAddress}</code>\n` +
+        `Пул: <code>${pairAddress}</code>\n` +
+        `Резервы: ${parseFloat(reserve0).toFixed(2)} ${tokenInfo.symbol} / ${parseFloat(reserve1).toFixed(4)} ${netKey === 'BSC' ? 'BNB' : 'ETH'}`,
+        { parse_mode: 'HTML' }
+      );
+      
+      console.log(`Подписка создана: ${tokenInfo.symbol} (${net.label}), резервы: ${reserve0} / ${reserve1}`);
+      
+      // Проверочное сообщение
+      setTimeout(() => {
+        bot.sendMessage(
+          chatId,
+          `ℹ️ Проверка работы подписки...\nЕсли в течение 5 минут вы не видите сделок, проверьте:\n1. Что пул активен\n2. Что есть торговля по токену\n3. Что бот не вывел ошибок в консоль`
+        );
+      }, 10000);
+      
+    } catch (e) {
+      console.error('Ошибка при получении резервов:', e);
+      bot.sendMessage(
+        chatId,
+        `✅ Подписка на ${tokenInfo.symbol} (${tokenInfo.name}) в сети ${net.label} активна!\n` +
+        `Адрес токена: <code>${tokenAddress}</code>\n` +
+        `Пул: <code>${pairAddress}</code>`,
+        { parse_mode: 'HTML' }
+      );
+    }
   }
 });
+
+// Мониторинг состояния подписок
+setInterval(() => {
+  console.log("\n===== СТАТУС ПОДПИСОК =====");
+  console.log(`Активных пользователей: ${users.size}`);
+  
+  for (const [netKey, netInfo] of Object.entries(networkProviders)) {
+    if (!netInfo) continue;
+    
+    let statusText = 'UNKNOWN';
+    if (netInfo.provider.websocket) {
+      const status = netInfo.provider.websocket.readyState;
+      switch(status) {
+        case 0: statusText = 'CONNECTING'; break;
+        case 1: statusText = 'OPEN'; break;
+        case 2: statusText = 'CLOSING'; break;
+        case 3: statusText = 'CLOSED'; break;
+        default: statusText = 'UNKNOWN';
+      }
+    }
+    
+    console.log(`[${netKey}] Подписок: ${netInfo.subscriptions.length}`);
+    console.log(`[${netKey}] WebSocket: ${netInfo.provider.connection.url}`);
+    console.log(`[${netKey}] Статус: ${statusText}`);
+    
+    // Проверяем последний блок
+    netInfo.provider.getBlockNumber()
+      .then(block => console.log(`[${netKey}] Последний блок: ${block}`))
+      .catch(e => console.error(`[${netKey}] Ошибка получения блока:`, e));
+  }
+  console.log("==========================\n");
+}, 300000); // Каждые 5 минут
 
 // Обработка ошибок опроса
 bot.on('polling_error', (error) => {
