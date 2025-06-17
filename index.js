@@ -21,7 +21,7 @@ const NETWORKS = {
   BSC: {
     label: 'BSC',
     rpc: process.env.BSC_RPC || 'https://bsc-dataseed.binance.org/',
-    ws: process.env.BSC_WS || 'wss://go.getblock.io/c63d882b922d447f9e6c9aabfe9a573f', // ЗАМЕНИТЕ API KEY
+    ws: process.env.BSC_WS || 'wss://bsc-mainnet.core.chainstack.com/44dc2637f9e528e36a7491ecb2462ebd', // ЗАМЕНИТЕ API KEY
     factory: '0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73',
     weth: '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c',
     explorer: 'https://bscscan.com/tx/'
